@@ -48,7 +48,7 @@ These criteria match the professional standards used by IASC and Astrometrica:
 | 8 | **Catalogue Cross-Check** | Position doesn't match a known star | Not in catalogue |
 | 9 | **False Positive Rejection** | Eliminates cosmic rays, hot pixels, noise | Multiple checks |
 
-A candidate must score >= 70% confidence **and** pass both criteria 1 (persistence) and 9 (false positive rejection) as hard gates.
+A candidate must score >= 70% confidence **and** pass all three hard gates: criteria 1 (persistence), 5 (linear motion), and 9 (false positive rejection).
 
 ---
 
