@@ -1356,24 +1356,219 @@ def run_validation(verbose=True):
     return result, truth, validation_report
 
 
+# =============================================================================
+# VISUALISATION OUTPUTS
+# =============================================================================
+# Generate the 3 required PNG files for the science fair display board
+
+def create_visualisations(frames, result, truth=None, output_dir='.'):
+    """
+    Generate all 3 required visualisation PNG files.
+
+    1. Detection image: shows frame 1 with candidates circled
+    2. Motion trail plot: shows how each asteroid moved across frames
+    3. Comparison bar chart: algorithm vs manual Astrometrica performance
+
+    Parameters:
+        frames: the 4 image frames
+        result: DetectionResult from the pipeline
+        truth: ground truth data (if available, for synthetic mode)
+        output_dir: directory to save the PNG files
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ---- Visualisation 1: Annotated Detection Image ----
+    print("\n  Generating visualisation 1: Annotated detection image...")
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    fig.suptitle('Asteroid Detection — All 4 Frames with Candidates Circled',
+                 fontsize=14, fontweight='bold')
+
+    for i, (ax, frame) in enumerate(zip(axes, frames)):
+        # Display image with astronomical colour scaling
+        vmin = np.percentile(frame, 5)
+        vmax = np.percentile(frame, 99)
+        ax.imshow(frame, cmap='gray', origin='lower', vmin=vmin, vmax=vmax)
+        ax.set_title(f'Frame {i + 1} (t = +{i * FRAME_INTERVAL_MINUTES:.0f} min)',
+                    fontsize=10)
+        ax.set_xlabel('X (pixels)')
+        if i == 0:
+            ax.set_ylabel('Y (pixels)')
+
+        # Circle each candidate's position in this frame
+        for c_idx, candidate in enumerate(result.candidates):
+            source = candidate.sources[i]
+            color = ['lime', 'cyan', 'magenta', 'yellow', 'red'][c_idx % 5]
+            circle = patches.Circle(
+                (source.x, source.y), radius=12,
+                linewidth=2, edgecolor=color, facecolor='none'
+            )
+            ax.add_patch(circle)
+            if i == 0:  # Label only in first frame to avoid clutter
+                ax.annotate(f'C{c_idx + 1}',
+                          (source.x, source.y + 16),
+                          color=color, fontsize=9, fontweight='bold',
+                          ha='center')
+
+        # Mark ground truth asteroids with squares (if we have truth data)
+        if truth:
+            for a_idx, ast in enumerate(truth['asteroids']):
+                pos = ast['positions'][i]
+                rect = patches.Rectangle(
+                    (pos['x'] - 8, pos['y'] - 8), 16, 16,
+                    linewidth=1, edgecolor='red', facecolor='none',
+                    linestyle='--'
+                )
+                ax.add_patch(rect)
+
+    plt.tight_layout()
+    path1 = os.path.join(output_dir, 'detection_annotated.png')
+    plt.savefig(path1, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {path1}")
+
+    # ---- Visualisation 2: Motion Trail Plot ----
+    print("  Generating visualisation 2: Motion trail plot...")
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    ax.set_title('Asteroid Motion Trails Across 4 Frames',
+                fontsize=14, fontweight='bold')
+
+    # Show first frame as background
+    vmin = np.percentile(frames[0], 5)
+    vmax = np.percentile(frames[0], 99)
+    ax.imshow(frames[0], cmap='gray', origin='lower', vmin=vmin, vmax=vmax,
+             alpha=0.5)
+
+    # Draw motion trails for each candidate
+    colors = ['lime', 'cyan', 'magenta', 'yellow', 'red']
+    for c_idx, candidate in enumerate(result.candidates):
+        xs = [s.x for s in candidate.sources]
+        ys = [s.y for s in candidate.sources]
+        color = colors[c_idx % len(colors)]
+
+        # Draw the trail line
+        ax.plot(xs, ys, '-', color=color, linewidth=2, alpha=0.8)
+
+        # Mark each frame position with a dot
+        for f_idx, (x, y) in enumerate(zip(xs, ys)):
+            marker_size = 80 if f_idx == 0 else 50
+            ax.scatter(x, y, s=marker_size, color=color, zorder=5,
+                      edgecolors='white', linewidths=0.5)
+            ax.annotate(f'F{f_idx + 1}', (x + 5, y + 5),
+                       color=color, fontsize=8)
+
+        # Add candidate label
+        ax.annotate(
+            f'Candidate {c_idx + 1}\n'
+            f'Rate: {candidate.velocity_arcsec_min:.3f}"/min\n'
+            f'Conf: {candidate.confidence_score:.0f}%',
+            (xs[0] - 30, ys[0] - 20),
+            color=color, fontsize=9,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7)
+        )
+
+    # Draw arrow showing direction of motion
+    ax.set_xlabel('X (pixels)', fontsize=12)
+    ax.set_ylabel('Y (pixels)', fontsize=12)
+    ax.legend(
+        [plt.Line2D([0], [0], color=colors[i], lw=2)
+         for i in range(min(len(result.candidates), 5))],
+        [f'Candidate {i+1}' for i in range(min(len(result.candidates), 5))],
+        loc='upper right', fontsize=10
+    )
+
+    plt.tight_layout()
+    path2 = os.path.join(output_dir, 'motion_trails.png')
+    plt.savefig(path2, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {path2}")
+
+    # ---- Visualisation 3: Comparison Bar Chart ----
+    print("  Generating visualisation 3: Algorithm vs Astrometrica comparison...")
+    fig, axes = plt.subplots(1, 3, figsize=(15, 6))
+    fig.suptitle('Algorithm Performance vs Manual Astrometrica',
+                fontsize=14, fontweight='bold')
+
+    bar_width = 0.35
+    algo_color = '#2196F3'   # Blue
+    manual_color = '#FF9800'  # Orange
+
+    # Chart A: Processing Time
+    ax = axes[0]
+    times = [result.processing_time_seconds, 25 * 60]  # Algorithm vs 25 min
+    bars = ax.bar(['Algorithm', 'Astrometrica\n(manual)'], times,
+                 color=[algo_color, manual_color], width=0.5)
+    ax.set_ylabel('Processing Time (seconds)', fontsize=11)
+    ax.set_title('Speed Comparison', fontsize=12)
+    for bar, val in zip(bars, times):
+        label = f'{val:.1f}s' if val < 60 else f'{val / 60:.0f} min'
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 10,
+               label, ha='center', va='bottom', fontweight='bold')
+
+    # Chart B: Detection Accuracy
+    ax = axes[1]
+    accuracies = [result.detection_accuracy, 87.5]  # Algorithm vs ~87.5%
+    bars = ax.bar(['Algorithm', 'Astrometrica\n(manual)'], accuracies,
+                 color=[algo_color, manual_color], width=0.5)
+    ax.set_ylabel('Detection Accuracy (%)', fontsize=11)
+    ax.set_title('Accuracy Comparison', fontsize=12)
+    ax.set_ylim(0, 110)
+    for bar, val in zip(bars, accuracies):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+               f'{val:.0f}%', ha='center', va='bottom', fontweight='bold')
+
+    # Chart C: False Positive Rate
+    ax = axes[2]
+    fp_rates = [result.false_positive_rate, 17.5]  # Algorithm vs ~17.5%
+    bars = ax.bar(['Algorithm', 'Astrometrica\n(manual)'], fp_rates,
+                 color=[algo_color, manual_color], width=0.5)
+    ax.set_ylabel('False Positive Rate (%)', fontsize=11)
+    ax.set_title('False Positive Comparison', fontsize=12)
+    ax.set_ylim(0, 30)
+    for bar, val in zip(bars, fp_rates):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
+               f'{val:.0f}%', ha='center', va='bottom', fontweight='bold')
+
+    plt.tight_layout()
+    path3 = os.path.join(output_dir, 'comparison_chart.png')
+    plt.savefig(path3, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"    Saved: {path3}")
+
+    return [path1, path2, path3]
+
 
 # =============================================================================
 # FITS FILE LOADER (for real telescope data)
 # =============================================================================
 
 def load_fits_frames(file_paths):
-    """Load real FITS image files from disk."""
+    """
+    Load real FITS image files from disk.
+
+    FITS (Flexible Image Transport System) is the standard file format
+    for astronomical images. Pan-STARRS and every other major telescope
+    saves data in FITS format.
+
+    Parameters:
+        file_paths: list of 4 file paths to FITS images
+
+    Returns:
+        frames: list of 4 numpy 2D arrays
+    """
     try:
         from astropy.io import fits
     except ImportError:
         print("  ERROR: astropy is required to read FITS files.")
+        print("  Install it with: pip install astropy")
         return None
+
     frames = []
     for path in file_paths:
         if not os.path.exists(path):
             print(f"  ERROR: File not found: {path}")
             return None
         with fits.open(path) as hdul:
+            # Use the primary HDU data (or the first image extension)
             data = hdul[0].data
             if data is None and len(hdul) > 1:
                 data = hdul[1].data
@@ -1382,6 +1577,7 @@ def load_fits_frames(file_paths):
                 return None
             frames.append(data.astype(float))
         print(f"  Loaded: {path} ({data.shape[1]}x{data.shape[0]} pixels)")
+
     return frames
 
 
@@ -1406,39 +1602,90 @@ def print_banner():
 
 
 def main():
-    """Main entry point for the asteroid detection algorithm."""
+    """
+    Main entry point for the asteroid detection algorithm.
+
+    Usage:
+        python asteroid_detector.py --validate     Run synthetic validation test
+        python asteroid_detector.py --fits f1 f2 f3 f4   Process real FITS files
+        python asteroid_detector.py               Run default demo with synthetic data
+    """
     parser = argparse.ArgumentParser(
-        description='Automated Asteroid Detection Algorithm — TVSEF 2026')
+        description='Automated Asteroid Detection Algorithm — TVSEF 2026',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python asteroid_detector.py --validate        Run full validation with synthetic data
+  python asteroid_detector.py --fits img1.fits img2.fits img3.fits img4.fits
+  python asteroid_detector.py                   Run default demo
+        """
+    )
     parser.add_argument('--validate', action='store_true',
                        help='Run validation mode with synthetic test data')
     parser.add_argument('--fits', nargs=4, metavar='FILE',
                        help='Process 4 real FITS image files')
     parser.add_argument('--output-dir', default='.',
-                       help='Directory to save output files')
+                       help='Directory to save output files (default: current)')
+
     args = parser.parse_args()
+
     print_banner()
 
     if args.fits:
+        # ---- Real FITS file mode ----
         print("  MODE: Processing real FITS image files")
         frames = load_fits_frames(args.fits)
         if frames is None:
+            print("\n  FATAL: Could not load FITS files. Exiting.")
             sys.exit(1)
         result = run_detection_pipeline(frames, verbose=True)
+        create_visualisations(frames, result, output_dir=args.output_dir)
 
     elif args.validate:
+        # ---- Validation mode ----
         print("  MODE: Synthetic data validation test")
         result, truth, report = run_validation(verbose=True)
-        print(f"\n  Detection accuracy: {report['detection_accuracy_pct']:.1f}%")
+        create_visualisations(
+            generate_synthetic_frames()[0],
+            result, truth,
+            output_dir=args.output_dir
+        )
+
+        # Print the final summary for the logbook
+        print("\n" + "=" * 70)
+        print("  FINAL VALIDATION SUMMARY (for science fair logbook)")
+        print("=" * 70)
+        print(f"  Date: 2026-03-09")
+        print(f"  Algorithm version: 1.0")
+        print(f"  Test: Synthetic ground truth validation")
+        print(f"  Asteroids planted: {report['asteroids_planted']}")
+        print(f"  Asteroids detected: {report['asteroids_detected']}")
+        print(f"  Detection accuracy: {report['detection_accuracy_pct']:.1f}%")
+        print(f"  False positives: {report['false_positives']}")
         print(f"  False positive rate: {report['false_positive_rate_pct']:.1f}%")
+        print(f"  Processing time: {report['processing_time_sec']:.2f} seconds")
+        print(f"  Total sources analysed: {report['total_sources']}")
+        print(f"  Tracklets formed: {report['total_tracklets']}")
+        print(f"  Output files saved:")
+        print(f"    - detection_annotated.png")
+        print(f"    - motion_trails.png")
+        print(f"    - comparison_chart.png")
+        print("=" * 70)
 
     else:
-        print("  MODE: Default demo (use --validate for full test)")
+        # ---- Default demo mode ----
+        print("  MODE: Default demonstration with synthetic data")
+        print("  (Use --validate for full validation, --fits for real data)")
         frames, truth = generate_synthetic_frames()
         result = run_detection_pipeline(frames, verbose=True)
+        create_visualisations(frames, result, truth, output_dir=args.output_dir)
 
     print("\n  Algorithm finished successfully!")
     return 0
 
 
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 if __name__ == "__main__":
     sys.exit(main())
