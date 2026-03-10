@@ -691,16 +691,449 @@ def measure_psf(image, cx, cy, expected_sigma, box_radius=10):
         return TYPICAL_FWHM, 0.15
 
 
+# =============================================================================
+# MOTION LINKING ENGINE
+# =============================================================================
+# This connects sources across frames to find things that moved
+
+def link_tracklets(all_sources, search_radius_pixels=80.0,
+                    min_motion_pixels=3.0):
+    """
+    Link sources across 4 frames to find objects that moved consistently.
+
+    This is the key astronomical algorithm. For each source in frame 1, we
+    look for a DIFFERENT source in frame 2 that has moved by at least a
+    minimum distance (to exclude stationary stars). We then predict where
+    the object should appear in frames 3 and 4 and search for matches.
+
+    The search radius of 80 pixels covers asteroid motion rates up to
+    about 0.67 arcsec/min at Pan-STARRS pixel scale (0.25"/pix), which
+    handles typical main-belt asteroids (0.3-0.5 arcsec/min) with generous
+    margin. The minimum motion of 3 pixels eliminates stationary stars.
+
+    Math: 0.5 arcsec/min * 30 min / 0.25 arcsec/pixel = 60 pixels/frame
+    So 80 pixels gives us comfortable headroom.
+
+    Parameters:
+        all_sources: list of all Source objects from all 4 frames
+        search_radius_pixels: maximum distance between two detections
+                             in consecutive frames to consider a match
+        min_motion_pixels: minimum motion per frame to be considered
+                          (filters out stationary stars)
+
+    Returns:
+        tracklets: list of Tracklet objects (only moving objects)
+    """
+    # Separate sources by frame
+    frame_sources = [[] for _ in range(NUM_FRAMES)]
+    for s in all_sources:
+        if 0 <= s.frame_index < NUM_FRAMES:
+            frame_sources[s.frame_index].append(s)
+
+    # Check we have sources in all frames
+    for i in range(NUM_FRAMES):
+        if len(frame_sources[i]) == 0:
+            return []
+
+    # Build spatial index trees for fast neighbour searching
+    # (cKDTree is much faster than checking every pair)
+    trees = []
+    for fi in range(NUM_FRAMES):
+        positions = np.array([[s.x, s.y] for s in frame_sources[fi]])
+        trees.append(cKDTree(positions))
+
+    # --- Phase 1: Generate ALL candidate tracklets ---
+    # We collect every valid 4-frame linkage, then pick the best ones.
+    # This avoids the problem where a greedy algorithm makes a bad early
+    # match that blocks a better match later.
+    all_candidate_tracklets = []
+
+    for i0, s0 in enumerate(frame_sources[0]):
+        # Find candidate matches in frame 1 within the search radius
+        candidates_f1 = trees[1].query_ball_point([s0.x, s0.y],
+                                                   search_radius_pixels)
+
+        for i1 in candidates_f1:
+            s1 = frame_sources[1][i1]
+
+            # Calculate velocity from frame 0 to frame 1
+            vx = s1.x - s0.x
+            vy = s1.y - s0.y
+            speed = np.sqrt(vx**2 + vy**2)
+
+            # CRITICAL FILTER: Skip if motion is too small
+            # Stars appear at the same position (+/- sub-pixel noise)
+            # Real asteroids must move at least min_motion_pixels per frame
+            if speed < min_motion_pixels:
+                continue
+
+            # BRIGHTNESS CONSISTENCY: Skip if magnitudes are wildly different
+            # Real asteroids maintain similar brightness across frames.
+            # A 2-magnitude difference means the linker is probably matching
+            # the asteroid with an unrelated star in another frame.
+            if abs(s0.magnitude - s1.magnitude) > 2.0:
+                continue
+
+            # Predict position in frame 2 (assuming constant velocity)
+            pred_x2 = s1.x + vx
+            pred_y2 = s1.y + vy
+
+            # Search for a match near the predicted position in frame 2
+            # The search radius scales with speed but has a minimum floor.
+            # We use 35% of the speed to allow for small centroid errors
+            # from noise, blending with nearby stars, or seeing variations.
+            tight_radius = max(8.0, speed * 0.35)
+            candidates_f2 = trees[2].query_ball_point(
+                [pred_x2, pred_y2], tight_radius)
+
+            for i2 in candidates_f2:
+                s2 = frame_sources[2][i2]
+
+                # Magnitude consistency check
+                if abs(s2.magnitude - s0.magnitude) > 2.0:
+                    continue
+
+                # Predict position in frame 3
+                pred_x3 = s2.x + vx
+                pred_y3 = s2.y + vy
+
+                # Search for a match in frame 3
+                candidates_f3 = trees[3].query_ball_point(
+                    [pred_x3, pred_y3], tight_radius)
+
+                for i3 in candidates_f3:
+                    s3 = frame_sources[3][i3]
+
+                    # Magnitude consistency check
+                    if abs(s3.magnitude - s0.magnitude) > 2.0:
+                        continue
+
+                    # Score this tracklet by positional residual +
+                    # magnitude consistency + velocity consistency.
+                    # Lower score = better tracklet.
+                    res2 = np.sqrt((s2.x - pred_x2)**2 +
+                                  (s2.y - pred_y2)**2)
+                    res3 = np.sqrt((s3.x - pred_x3)**2 +
+                                  (s3.y - pred_y3)**2)
+                    mag_spread = np.std([s0.magnitude, s1.magnitude,
+                                        s2.magnitude, s3.magnitude])
+                    # Velocity consistency: check frame 2->3 speed
+                    vx23 = s3.x - s2.x
+                    vy23 = s3.y - s2.y
+                    vel_diff = np.sqrt((vx23 - vx)**2 + (vy23 - vy)**2)
+                    # Combined quality (lower is better).
+                    # Weight magnitude heavily to avoid star-asteroid confusion
+                    quality = (res2 + res3 +
+                              mag_spread * 10.0 +
+                              vel_diff * 2.0)
+
+                    all_candidate_tracklets.append({
+                        'indices': (i0, i1, i2, i3),
+                        'sources': (s0, s1, s2, s3),
+                        'quality': quality
+                    })
+
+    # --- Phase 2: Select best non-overlapping tracklets ---
+    # Sort by quality (best first) and greedily select tracklets
+    # that don't reuse any source
+    all_candidate_tracklets.sort(key=lambda t: t['quality'])
+
+    tracklets = []
+    used_in_frame = [set() for _ in range(NUM_FRAMES)]
+
+    for ct in all_candidate_tracklets:
+        i0, i1, i2, i3 = ct['indices']
+        # Check none of these sources are already used
+        if (i0 in used_in_frame[0] or i1 in used_in_frame[1] or
+                i2 in used_in_frame[2] or i3 in used_in_frame[3]):
+            continue
+
+        s0, s1, s2, s3 = ct['sources']
+        tracklet = Tracklet(sources=[s0, s1, s2, s3])
+        tracklets.append(tracklet)
+        used_in_frame[0].add(i0)
+        used_in_frame[1].add(i1)
+        used_in_frame[2].add(i2)
+        used_in_frame[3].add(i3)
+
+    # Calculate motion properties for each tracklet
+    for t in tracklets:
+        compute_tracklet_properties(t)
+
+    return tracklets
+
+
+def compute_tracklet_properties(tracklet):
+    """
+    Calculate the motion properties of a linked tracklet.
+
+    Once we have 4 linked detections, we measure:
+    - Average velocity (speed and direction)
+    - Speed in astronomical units (arcseconds per minute)
+    - Average magnitude (brightness)
+
+    Parameters:
+        tracklet: a Tracklet object with 4 linked sources
+    """
+    sources = tracklet.sources
+
+    # Velocity from first to last source
+    dx = sources[-1].x - sources[0].x
+    dy = sources[-1].y - sources[0].y
+    n_intervals = len(sources) - 1
+
+    tracklet.velocity_x = dx / n_intervals
+    tracklet.velocity_y = dy / n_intervals
+
+    # Convert to arcseconds per minute
+    speed_pixels_per_frame = np.sqrt(tracklet.velocity_x**2 +
+                                     tracklet.velocity_y**2)
+    speed_arcsec_per_frame = speed_pixels_per_frame * PIXEL_SCALE
+    tracklet.velocity_arcsec_min = speed_arcsec_per_frame / FRAME_INTERVAL_MINUTES
+
+    # Position angle (direction of motion, in degrees from North)
+    tracklet.position_angle = np.degrees(
+        np.arctan2(tracklet.velocity_x, -tracklet.velocity_y)) % 360
+
+    # Mean magnitude
+    tracklet.mean_magnitude = np.mean([s.magnitude for s in sources])
+
 
 # =============================================================================
-# COMMAND-LINE INTERFACE (placeholder — linking engine coming next)
+# 9-CRITERIA VALIDATION ENGINE
+# =============================================================================
+# These are the exact same criteria professional astronomers and IASC
+# participants use to verify asteroid detections
+
+def validate_tracklet(tracklet, all_sources_per_frame=None):
+    """
+    Apply all 9 IASC/Astrometrica verification criteria to a tracklet.
+
+    Each criterion returns True (passed) or False (failed), along with
+    a measured value and a note explaining the result.
+
+    This is the heart of the algorithm — the part that separates real
+    asteroids from false detections. A human astronomer checks these same
+    things by eye in Astrometrica; our algorithm does it mathematically.
+
+    Parameters:
+        tracklet: a Tracklet object to validate
+        all_sources_per_frame: optional, list of source counts per frame
+                              (used for some criteria)
+
+    Returns:
+        criteria_results: dictionary with results for each criterion
+        confidence: overall confidence score (0-100%)
+    """
+    sources = tracklet.sources
+    criteria = {}
+
+    # ---- Criterion 1: PERSISTENCE ----
+    # Real asteroids appear in ALL 4 frames.
+    # Cosmic rays only hit 1 frame. Hot pixels are always in the same spot.
+    n_frames = len(sources)
+    frame_indices = set(s.frame_index for s in sources)
+    persistence_pass = (n_frames >= NUM_FRAMES and
+                        len(frame_indices) == NUM_FRAMES)
+    criteria['1_persistence'] = {
+        'passed': persistence_pass,
+        'value': n_frames,
+        'threshold': NUM_FRAMES,
+        'note': f'Detected in {n_frames}/{NUM_FRAMES} frames'
+    }
+
+    # ---- Criterion 2: SIGNAL-TO-NOISE RATIO ----
+    # All detections must be above SNR 5 to be reliable.
+    # Below this, the object is lost in the noise.
+    snr_values = [s.snr for s in sources]
+    min_snr = min(snr_values)
+    mean_snr = np.mean(snr_values)
+    snr_pass = min_snr >= SNR_THRESHOLD
+    criteria['2_snr'] = {
+        'passed': snr_pass,
+        'value': round(mean_snr, 1),
+        'threshold': SNR_THRESHOLD,
+        'note': f'Mean SNR={mean_snr:.1f}, Min SNR={min_snr:.1f}'
+    }
+
+    # ---- Criterion 3: PSF GAUSSIAN FIT ----
+    # Real point sources have smooth bell-curve brightness profiles.
+    # Cosmic rays are too sharp. Extended objects are too wide.
+    fit_rms_values = [s.fit_rms for s in sources]
+    mean_fit_rms = np.mean(fit_rms_values)
+    psf_pass = mean_fit_rms < FIT_RMS_THRESHOLD
+    criteria['3_psf_fit'] = {
+        'passed': psf_pass,
+        'value': round(mean_fit_rms, 3),
+        'threshold': FIT_RMS_THRESHOLD,
+        'note': f'Mean Fit RMS={mean_fit_rms:.3f} (< {FIT_RMS_THRESHOLD} required)'
+    }
+
+    # ---- Criterion 4: FWHM CONSISTENCY ----
+    # The width of the source should match the telescope's seeing.
+    # Pan-STARRS typical seeing: 0.8-1.2 arcseconds.
+    fwhm_values = [s.fwhm for s in sources]
+    mean_fwhm = np.mean(fwhm_values)
+    fwhm_pass = FWHM_MIN <= mean_fwhm <= FWHM_MAX
+    criteria['4_fwhm'] = {
+        'passed': fwhm_pass,
+        'value': round(mean_fwhm, 2),
+        'threshold': f'{FWHM_MIN}-{FWHM_MAX}',
+        'note': f'Mean FWHM={mean_fwhm:.2f}" (range {FWHM_MIN}-{FWHM_MAX}")'
+    }
+
+    # ---- Criterion 5: LINEAR MOTION ----
+    # Main belt asteroids move in straight lines over 2 hours.
+    # We fit a straight line to the 4 positions and measure the deviation.
+    positions = np.array([[s.x, s.y] for s in sources])
+    times = np.array([s.frame_index for s in sources])
+
+    # Fit linear motion model: position = start + velocity * time
+    if len(times) >= 2:
+        # Linear regression for x and y separately
+        coeffs_x = np.polyfit(times, positions[:, 0], 1)
+        coeffs_y = np.polyfit(times, positions[:, 1], 1)
+        predicted_x = np.polyval(coeffs_x, times)
+        predicted_y = np.polyval(coeffs_y, times)
+        residuals = np.sqrt((positions[:, 0] - predicted_x)**2 +
+                           (positions[:, 1] - predicted_y)**2)
+        max_residual = np.max(residuals)
+    else:
+        max_residual = 0.0
+
+    linearity_pass = max_residual < LINEARITY_THRESHOLD
+    criteria['5_linear_motion'] = {
+        'passed': linearity_pass,
+        'value': round(max_residual, 2),
+        'threshold': LINEARITY_THRESHOLD,
+        'note': f'Max deviation from line: {max_residual:.2f} pixels'
+    }
+
+    # ---- Criterion 6: CONSTANT VELOCITY ----
+    # The speed should not change more than 10% between consecutive frames.
+    velocities = []
+    for i in range(len(sources) - 1):
+        dx = sources[i + 1].x - sources[i].x
+        dy = sources[i + 1].y - sources[i].y
+        v = np.sqrt(dx**2 + dy**2)
+        velocities.append(v)
+
+    if len(velocities) >= 2 and np.mean(velocities) > 0:
+        mean_vel = np.mean(velocities)
+        max_variation = max(abs(v - mean_vel) / mean_vel for v in velocities)
+    else:
+        max_variation = 0.0
+
+    velocity_pass = max_variation < VELOCITY_VARIATION_MAX
+    criteria['6_constant_velocity'] = {
+        'passed': velocity_pass,
+        'value': round(max_variation * 100, 1),
+        'threshold': f'{VELOCITY_VARIATION_MAX * 100}%',
+        'note': f'Velocity variation: {max_variation * 100:.1f}%'
+    }
+
+    # ---- Criterion 7: STABLE MAGNITUDE ----
+    # Real asteroids do not change brightness dramatically between frames.
+    # (They can rotate and vary slowly, but not by more than 1 magnitude
+    # over 2 hours for typical main-belt asteroids.)
+    magnitudes = [s.magnitude for s in sources]
+    mag_range = max(magnitudes) - min(magnitudes)
+    magnitude_pass = mag_range < MAGNITUDE_VARIATION_MAX
+    criteria['7_stable_magnitude'] = {
+        'passed': magnitude_pass,
+        'value': round(mag_range, 2),
+        'threshold': MAGNITUDE_VARIATION_MAX,
+        'note': f'Magnitude range: {mag_range:.2f} mag'
+    }
+
+    # ---- Criterion 8: NOT IN KNOWN CATALOGUES ----
+    # In a real deployment, we would query the Minor Planet Center's
+    # MPCORB catalogue, SkyBot, or NEOCP to check if this is a known
+    # object. For the offline demo, we simulate this check.
+    # (Set to True since we cannot check online in a demo)
+    catalogue_pass = True
+    criteria['8_not_known'] = {
+        'passed': catalogue_pass,
+        'value': 'N/A (offline mode)',
+        'threshold': 'No match in MPC/SkyBot',
+        'note': 'Catalogue check: skipped (offline demo mode)'
+    }
+
+    # ---- Criterion 9: NOT A FALSE POSITIVE ----
+    # Check for common false positive patterns:
+    # - Zero motion (hot pixel that got linked by accident)
+    # - Very fast motion (satellite)
+    # - Source at exact same pixel position each frame (hot pixel)
+    speed = np.sqrt(tracklet.velocity_x**2 + tracklet.velocity_y**2)
+    is_stationary = speed < 1.0  # Less than 1 pixel of motion total
+    is_too_fast = tracklet.velocity_arcsec_min > 2.0  # Satellites move > 2"/min
+
+    # Check if positions are identical (hot pixel signature)
+    pos_spread = np.std(positions, axis=0)
+    is_hot_pixel = np.all(pos_spread < 0.5)
+
+    false_positive_pass = not (is_stationary or is_too_fast or is_hot_pixel)
+    fp_reason = 'Passed all false positive checks'
+    if is_stationary:
+        fp_reason = 'FAILED: Object appears stationary (hot pixel?)'
+    elif is_too_fast:
+        fp_reason = 'FAILED: Motion too fast (satellite?)'
+    elif is_hot_pixel:
+        fp_reason = 'FAILED: Same position in all frames (hot pixel)'
+
+    criteria['9_not_false_positive'] = {
+        'passed': false_positive_pass,
+        'value': f'{tracklet.velocity_arcsec_min:.3f} arcsec/min',
+        'threshold': '0.1-2.0 arcsec/min',
+        'note': fp_reason
+    }
+
+    # ---- Calculate overall confidence score ----
+    # Each criterion contributes to the final score
+    # Some criteria are weighted more heavily (persistence and SNR are critical)
+    weights = {
+        '1_persistence': 20,      # Must be in all 4 frames
+        '2_snr': 15,              # Must be clearly above noise
+        '3_psf_fit': 10,          # Should look like a point source
+        '4_fwhm': 10,             # Right size for a star/asteroid
+        '5_linear_motion': 15,    # Must move in a straight line
+        '6_constant_velocity': 10, # Speed should be constant
+        '7_stable_magnitude': 10,  # Brightness should not jump
+        '8_not_known': 5,         # Bonus for unknown objects
+        '9_not_false_positive': 5  # Must not match false positive patterns
+    }
+
+    total_weight = sum(weights.values())
+    earned = sum(weights[k] for k, v in criteria.items() if v['passed'])
+    confidence = (earned / total_weight) * 100
+
+    tracklet.criteria_results = criteria
+    tracklet.confidence_score = confidence
+
+    # A candidate must pass BOTH the confidence threshold AND the
+    # critical hard-gate criteria. Persistence (criterion 1) and
+    # not-false-positive (criterion 9) are non-negotiable requirements
+    # — just like in real Astrometrica, if an object does not appear
+    # in all 4 frames or matches a false positive pattern, it is
+    # immediately rejected no matter how high the other scores are.
+    hard_gates_pass = (criteria['1_persistence']['passed'] and
+                       criteria['9_not_false_positive']['passed'])
+    tracklet.is_candidate = confidence >= 70 and hard_gates_pass
+
+    return criteria, confidence
+
+
+
+# =============================================================================
+# COMMAND-LINE INTERFACE (placeholder — validation mode coming next)
 # =============================================================================
 
 def main():
-    """Main entry point — source detection is now implemented."""
-    print("Automated Asteroid Detection Algorithm v0.2")
+    """Main entry point — motion linking and validation criteria added."""
+    print("Automated Asteroid Detection Algorithm v0.3")
     print("Author: Siddharth Patel (AstroSidSpace)")
-    print("Source detection engine added. Motion linking coming next.")
+    print("Motion linking and 9 criteria validation added.")
+    print("Validation mode and synthetic data coming next.")
     return 0
 
 
