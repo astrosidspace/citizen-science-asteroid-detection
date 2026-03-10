@@ -1123,23 +1123,322 @@ def validate_tracklet(tracklet, all_sources_per_frame=None):
     return criteria, confidence
 
 
+# =============================================================================
+# MAIN DETECTION PIPELINE
+# =============================================================================
+
+def run_detection_pipeline(frames, verbose=True):
+    """
+    Run the complete asteroid detection pipeline on a set of 4 frames.
+
+    This is the main function that orchestrates everything:
+    1. Detect sources in each frame
+    2. Link sources across frames to find moving objects
+    3. Validate each tracklet against the 9 criteria
+    4. Score and rank candidates
+
+    Parameters:
+        frames: list of 4 numpy 2D arrays (the images)
+        verbose: if True, print progress messages (good for live demo)
+
+    Returns:
+        result: a DetectionResult object with all findings
+    """
+    start_time = time.time()
+    result = DetectionResult()
+
+    if verbose:
+        print("\n" + "=" * 70)
+        print("  ASTEROID DETECTION PIPELINE — STARTING")
+        print("=" * 70)
+
+    # ---- Step 1: Detect sources in each frame ----
+    all_sources = []
+    for i, frame in enumerate(frames):
+        if verbose:
+            print(f"\n  [Frame {i + 1}/{NUM_FRAMES}] Detecting sources...", end="")
+        sources = detect_sources(frame, i)
+        all_sources.extend(sources)
+        if verbose:
+            print(f" found {len(sources)} sources")
+            # Show SNR statistics
+            if sources:
+                snrs = [s.snr for s in sources]
+                print(f"    SNR range: {min(snrs):.1f} — {max(snrs):.1f}, "
+                      f"mean: {np.mean(snrs):.1f}")
+
+    result.total_sources_detected = len(all_sources)
+    if verbose:
+        print(f"\n  Total sources across all frames: {result.total_sources_detected}")
+
+    # ---- Step 2: Link sources into tracklets ----
+    if verbose:
+        print("\n  [Linking] Searching for moving objects across frames...")
+    tracklets = link_tracklets(all_sources)
+    result.tracklets = tracklets
+    result.total_tracklets_formed = len(tracklets)
+    if verbose:
+        print(f"  Found {len(tracklets)} potential tracklets")
+
+    # ---- Step 3: Validate each tracklet ----
+    if verbose:
+        print("\n  [Validation] Applying 9 detection criteria to each tracklet...")
+    candidates = []
+    for idx, t in enumerate(tracklets):
+        criteria, confidence = validate_tracklet(t)
+        passed = sum(1 for c in criteria.values() if c['passed'])
+        if verbose:
+            status = "CANDIDATE" if t.is_candidate else "rejected"
+            print(f"    Tracklet {idx + 1}: {passed}/9 criteria passed, "
+                  f"confidence={confidence:.0f}% [{status}]")
+        if t.is_candidate:
+            candidates.append(t)
+
+    result.candidates = candidates
+    result.total_candidates_passed = len(candidates)
+
+    # ---- Calculate overall metrics ----
+    elapsed = time.time() - start_time
+    result.processing_time_seconds = elapsed
+
+    if verbose:
+        print(f"\n  {'=' * 50}")
+        print(f"  PIPELINE COMPLETE")
+        print(f"  Processing time: {elapsed:.2f} seconds")
+        print(f"  Sources detected: {result.total_sources_detected}")
+        print(f"  Tracklets formed: {result.total_tracklets_formed}")
+        print(f"  Candidates passed: {result.total_candidates_passed}")
+        print(f"  {'=' * 50}")
+
+    return result
+
 
 # =============================================================================
-# COMMAND-LINE INTERFACE (placeholder — validation mode coming next)
+# VALIDATION MODE
 # =============================================================================
+# Run the algorithm on synthetic data with known ground truth
+
+def run_validation(verbose=True):
+    """
+    Run a complete validation test using synthetic data.
+
+    This generates fake images with known asteroids, runs the detection
+    pipeline, and checks if the algorithm correctly found them. This is
+    our main proof that the algorithm works — we know the answers in advance.
+
+    The synthetic asteroids simulate objects like 2024 RH39 and 2024 RX69:
+    magnitude 19-21, motion rate 0.3-0.5 arcsec/min.
+
+    Returns:
+        result: DetectionResult from the pipeline
+        truth: ground truth data (what we planted)
+        validation_report: dictionary of validation metrics
+    """
+    if verbose:
+        print("\n" + "=" * 70)
+        print("  VALIDATION MODE — Synthetic Ground Truth Test")
+        print("=" * 70)
+        print("  Generating synthetic Pan-STARRS-like image data...")
+        print(f"  Image size: {SYNTHETIC_IMAGE_SIZE} x {SYNTHETIC_IMAGE_SIZE} pixels")
+        print(f"  Pixel scale: {PIXEL_SCALE} arcsec/pixel")
+        print(f"  Simulating: 3 asteroids, 80 stars, 5 cosmic rays, 3 hot pixels")
+
+    # Generate synthetic data
+    frames, truth = generate_synthetic_frames(
+        num_asteroids=3, num_stars=80,
+        num_cosmic_rays=5, num_hot_pixels=3
+    )
+
+    if verbose:
+        print("  Synthetic data generated successfully!")
+        print("\n  Known asteroid properties:")
+        for i, ast in enumerate(truth['asteroids']):
+            print(f"    Asteroid {i + 1}: mag={ast['magnitude']:.1f}, "
+                  f"rate={ast['rate_arcsec_min']:.3f} arcsec/min")
+
+    # Run the detection pipeline
+    result = run_detection_pipeline(frames, verbose=verbose)
+
+    # ---- Compare detections to ground truth ----
+    if verbose:
+        print("\n  [Ground Truth Comparison]")
+
+    num_planted = len(truth['asteroids'])
+    num_detected = 0
+    num_false_positives = 0
+
+    for candidate in result.candidates:
+        # Check if this candidate matches any planted asteroid
+        matched = False
+        for ast in truth['asteroids']:
+            # Compare first-frame position
+            ast_x = ast['positions'][0]['x']
+            ast_y = ast['positions'][0]['y']
+            dist = np.sqrt((candidate.sources[0].x - ast_x)**2 +
+                          (candidate.sources[0].y - ast_y)**2)
+            if dist < 15.0:  # Within 15 pixels = match
+                matched = True
+                num_detected += 1
+                break
+        if not matched:
+            num_false_positives += 1
+
+    detection_accuracy = (num_detected / num_planted * 100) if num_planted > 0 else 0
+    total_candidates = len(result.candidates)
+    false_positive_rate = (num_false_positives / max(total_candidates, 1)) * 100
+
+    result.detection_accuracy = detection_accuracy
+    result.false_positive_count = num_false_positives
+    result.false_positive_rate = false_positive_rate
+
+    validation_report = {
+        'asteroids_planted': num_planted,
+        'asteroids_detected': num_detected,
+        'false_positives': num_false_positives,
+        'detection_accuracy_pct': detection_accuracy,
+        'false_positive_rate_pct': false_positive_rate,
+        'processing_time_sec': result.processing_time_seconds,
+        'total_sources': result.total_sources_detected,
+        'total_tracklets': result.total_tracklets_formed,
+    }
+
+    if verbose:
+        print(f"\n  {'=' * 60}")
+        print(f"  VALIDATION REPORT")
+        print(f"  {'=' * 60}")
+        print(f"  Asteroids planted:       {num_planted}")
+        print(f"  Asteroids detected:      {num_detected}")
+        print(f"  False positives:         {num_false_positives}")
+        print(f"  Detection accuracy:      {detection_accuracy:.1f}%")
+        print(f"  False positive rate:     {false_positive_rate:.1f}%")
+        print(f"  Processing time:         {result.processing_time_seconds:.2f} seconds")
+        print(f"  {'=' * 60}")
+
+        # Print per-tracklet detailed report (ALL tracklets, not just candidates)
+        print(f"\n  ALL TRACKLET ANALYSIS (candidates and rejected)")
+        print(f"  {'-' * 60}")
+        for idx, t in enumerate(result.tracklets):
+            label = "CANDIDATE" if t.is_candidate else "REJECTED"
+            print(f"\n  Tracklet {idx + 1} [{label}]:")
+            print(f"    Position (frame 1): ({t.sources[0].x:.1f}, {t.sources[0].y:.1f})")
+            print(f"    Motion rate: {t.velocity_arcsec_min:.3f} arcsec/min")
+            print(f"    Direction: {t.position_angle:.1f} degrees")
+            print(f"    Mean magnitude: {t.mean_magnitude:.1f}")
+            print(f"    Confidence: {t.confidence_score:.0f}%")
+            print(f"    Criteria results:")
+            for crit_name, crit_val in t.criteria_results.items():
+                status = "PASS" if crit_val['passed'] else "FAIL"
+                print(f"      [{status}] {crit_name}: {crit_val['note']}")
+
+        # Print comparison table
+        print(f"\n  {'=' * 60}")
+        print(f"  ALGORITHM vs MANUAL ASTROMETRICA COMPARISON")
+        print(f"  {'=' * 60}")
+        print(f"  {'Metric':<35} {'Algorithm':<15} {'Astrometrica':<15}")
+        print(f"  {'-' * 60}")
+        print(f"  {'Processing time':<35} "
+              f"{result.processing_time_seconds:.1f} sec{'':<10} "
+              f"~25 min")
+        print(f"  {'Detection accuracy':<35} "
+              f"{detection_accuracy:.0f}%{'':<12} "
+              f"85-90%")
+        print(f"  {'False positive rate':<35} "
+              f"{false_positive_rate:.0f}%{'':<12} "
+              f"15-20%")
+        print(f"  {'Sources analysed':<35} "
+              f"{result.total_sources_detected:<15} "
+              f"~50-100")
+        print(f"  {'Criteria checked':<35} "
+              f"{'9 (automated)':<15} "
+              f"{'9 (manual)':<15}")
+        print(f"  {'=' * 60}")
+
+    return result, truth, validation_report
+
+
+
+# =============================================================================
+# FITS FILE LOADER (for real telescope data)
+# =============================================================================
+
+def load_fits_frames(file_paths):
+    """Load real FITS image files from disk."""
+    try:
+        from astropy.io import fits
+    except ImportError:
+        print("  ERROR: astropy is required to read FITS files.")
+        return None
+    frames = []
+    for path in file_paths:
+        if not os.path.exists(path):
+            print(f"  ERROR: File not found: {path}")
+            return None
+        with fits.open(path) as hdul:
+            data = hdul[0].data
+            if data is None and len(hdul) > 1:
+                data = hdul[1].data
+            if data is None:
+                print(f"  ERROR: No image data in {path}")
+                return None
+            frames.append(data.astype(float))
+        print(f"  Loaded: {path} ({data.shape[1]}x{data.shape[0]} pixels)")
+    return frames
+
+
+# =============================================================================
+# COMMAND-LINE INTERFACE
+# =============================================================================
+
+def print_banner():
+    """Print a nice header when the program starts."""
+    print("""
+ ============================================================
+       AUTOMATED ASTEROID DETECTION ALGORITHM  v1.0
+ ============================================================
+  Author: Siddharth Patel (AstroSidSpace)
+  RASC London Centre Youth Member
+  Discoverer of 2024 RH39 and 2024 RX69
+ ------------------------------------------------------------
+  TVSEF / CWSF 2026 Science Fair Project
+  AI-assisted development: Claude (Anthropic, 2026)
+ ============================================================
+    """)
+
 
 def main():
-    """Main entry point — motion linking and validation criteria added."""
-    print("Automated Asteroid Detection Algorithm v0.3")
-    print("Author: Siddharth Patel (AstroSidSpace)")
-    print("Motion linking and 9 criteria validation added.")
-    print("Validation mode and synthetic data coming next.")
+    """Main entry point for the asteroid detection algorithm."""
+    parser = argparse.ArgumentParser(
+        description='Automated Asteroid Detection Algorithm — TVSEF 2026')
+    parser.add_argument('--validate', action='store_true',
+                       help='Run validation mode with synthetic test data')
+    parser.add_argument('--fits', nargs=4, metavar='FILE',
+                       help='Process 4 real FITS image files')
+    parser.add_argument('--output-dir', default='.',
+                       help='Directory to save output files')
+    args = parser.parse_args()
+    print_banner()
+
+    if args.fits:
+        print("  MODE: Processing real FITS image files")
+        frames = load_fits_frames(args.fits)
+        if frames is None:
+            sys.exit(1)
+        result = run_detection_pipeline(frames, verbose=True)
+
+    elif args.validate:
+        print("  MODE: Synthetic data validation test")
+        result, truth, report = run_validation(verbose=True)
+        print(f"\n  Detection accuracy: {report['detection_accuracy_pct']:.1f}%")
+        print(f"  False positive rate: {report['false_positive_rate_pct']:.1f}%")
+
+    else:
+        print("  MODE: Default demo (use --validate for full test)")
+        frames, truth = generate_synthetic_frames()
+        result = run_detection_pipeline(frames, verbose=True)
+
+    print("\n  Algorithm finished successfully!")
     return 0
 
 
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
